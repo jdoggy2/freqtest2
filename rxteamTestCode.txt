@@ -1,0 +1,559 @@
+% =========================================================================
+%  CH_Live_Voltage.m
+%
+%  PHASE 1 - Diagnostic: collects 1 burst, plots CH0-CH3,
+%             prints stats table.
+%
+%  PHASE 2 - Live rolling plot (3-row layout):
+%    ROW 1  - CH1 RX-A (blue) | CH2 RX-B (red) | CH3 TX-ref (green)
+%    ROW 2  - FFT of CH1, CH2, CH3 + vertical markers at 8 target freqs
+%    ROW 3  - Bar chart: amplitude at each target freq for CH1/CH2/CH3
+%
+%  Target frequencies: 6000, 8000, 10000, 11000, 12000, 14000, 15000, 16000 Hz
+%
+%  Two's complement decode (ADS127L18):
+%    Wire format: [LSB | MID | MSB | CH_ID]
+%    if raw >= 0x800000 -> signed = raw - 2^24
+%    voltage = signed / 2^23 * Vref
+%
+%  PERFORMANCE NOTES:
+%    - Time domain + FFT update every burst (fast path)
+%    - Bar chart + 24 text labels update every BAR_UPDATE_EVERY bursts
+%    - HUD string built without loop concatenation
+% =========================================================================
+
+clear; clc; close all;
+
+%% ---- SETTINGS -----------------------------------------------------------
+COM_PORT         = 'COM3';
+BAUD_RATE        = 115200;
+VREF             = 4.096;
+K_GAIN           = 1;
+ROLL_BURSTS      = 100;
+BURST_PERIOD     = 0.065;
+DIAG_BURSTS      = 1;
+BAR_UPDATE_EVERY = 5;      % update bar chart every N bursts (reduces redraw cost)
+
+CH_A = 1;   % RX-A   (blue)
+CH_B = 2;   % RX-B   (red)
+CH_C = 3;   % TX ref (green)
+
+%% ---- TARGET FREQUENCIES -------------------------------------------------
+TARGET_FREQS  = [6000, 8000, 10000, 11000, 12000, 14000, 15000, 16000];
+N_TARGET      = length(TARGET_FREQS);
+TARGET_LABELS = {'6kHz','8kHz','10kHz','11kHz','12kHz','14kHz','15kHz','16kHz'};
+
+%% ---- CONSTANTS ----------------------------------------------------------
+FS_VOLTAGE     = K_GAIN * VREF;
+ADC_FULL_SCALE = 2^23;
+PACKET_SIZE    = 512;
+NUM_CHANNELS   = 4;
+f_DATA         = 128000;
+SAMP_PER_CH    = PACKET_SIZE / 4 / NUM_CHANNELS;   % 32 samples/ch/burst
+roll_n         = ROLL_BURSTS * SAMP_PER_CH;        % 3200 samples
+t_axis         = (0 : roll_n-1)' / f_DATA * 1e3;  % ms
+
+% FFT
+N_fft     = roll_n;
+f_vec     = (0 : N_fft/2) * (f_DATA / N_fft);     % Hz, one-sided
+f_vec_kHz = f_vec / 1e3;
+hann_win  = hann(N_fft);
+
+% Nearest FFT bin for each target frequency (1-indexed, clamped)
+delta_f     = f_DATA / N_fft;
+target_bins = min(round(TARGET_FREQS / delta_f) + 1, N_fft/2 + 1);
+
+fprintf('Target frequency bin map  (delta_f = %.3f Hz):\n', delta_f);
+for k = 1:N_TARGET
+    fprintf('  %6.0f Hz  ->  bin %d  (actual %.2f Hz)\n', ...
+        TARGET_FREQS(k), target_bins(k), f_vec(target_bins(k)));
+end
+fprintf('\n');
+
+% Manual bar x-offsets for 3 grouped bars  (MATLAB default group width = 0.8)
+sub_w       = 0.8 / 3;
+bar_offsets = [-(sub_w), 0, sub_w];
+
+%% ---- OPEN + ALIGN PORT --------------------------------------------------
+fprintf('Opening %s ...\n', COM_PORT);
+s = serialport(COM_PORT, BAUD_RATE, 'Timeout', 10);
+fprintf('Aligning to packet boundary...');
+flush(s); pause(BURST_PERIOD); flush(s);
+fprintf(' done.\n\n');
+
+%% =========================================================================
+%% PHASE 1: DIAGNOSTIC SNAPSHOT
+%% =========================================================================
+fprintf('PHASE 1: Collecting %d diagnostic burst(s)...\n\n', DIAG_BURSTS);
+
+diag_v   = NaN(DIAG_BURSTS * SAMP_PER_CH, NUM_CHANNELS);
+good     = 0;
+attempts = 0;
+
+while good < DIAG_BURSTS && attempts < DIAG_BURSTS * 5
+    attempts = attempts + 1;
+    raw = safe_read(s, PACKET_SIZE, BURST_PERIOD);
+    if isempty(raw); continue; end
+    [volts, ch_id] = decode_packet(raw, ADC_FULL_SCALE, FS_VOLTAGE);
+    if isempty(volts) || any(ch_id > 3); continue; end
+
+    good = good + 1;
+    rs   = (good-1)*SAMP_PER_CH + 1;
+    re   =  good   *SAMP_PER_CH;
+    for ch = 0:NUM_CHANNELS-1
+        v_ch = volts(ch_id == uint8(ch));
+        if length(v_ch) >= SAMP_PER_CH
+            diag_v(rs:re, ch+1) = v_ch(1:SAMP_PER_CH);
+        end
+    end
+end
+fprintf('\n');
+
+actual_n = good * SAMP_PER_CH;
+diag_v   = diag_v(1:actual_n, :);
+t_diag   = (0:actual_n-1)' / f_DATA * 1e3;
+pp_all   = max(diag_v,[],1) - min(diag_v,[],1);
+
+% Stats table
+fprintf('%-6s  %-10s  %-10s  %-10s  %-10s  %s\n', ...
+        'CH_ID','Min(mV)','Mean(mV)','Max(mV)','Pk-Pk(mV)','Assessment');
+fprintf('%s\n', repmat('-',1,72));
+for ch = 0:NUM_CHANNELS-1
+    v  = diag_v(:, ch+1);
+    v  = v(~isnan(v));
+    if isempty(v); fprintf('CH%-4d  NO DATA\n', ch); continue; end
+    pp = pp_all(ch+1)*1e3;
+    if     pp > 500; note = '<<< STRONG SIGNAL >>>';
+    elseif pp > 100; note = '<-- LIKELY SIGNAL';
+    elseif pp > 20;  note = '<-- possible signal';
+    elseif pp > 5;   note = 'low activity';
+    else;            note = 'quiet';
+    end
+    fprintf('CH%-4d  %+8.3f  %+8.3f  %+8.3f  %8.3f    %s\n', ...
+            ch, min(v)*1e3, mean(v)*1e3, max(v)*1e3, pp, note);
+end
+fprintf('\n');
+
+% Diagnostic figure
+cmap      = lines(4);
+ch_labels = {'CH0 - GND ref','CH1 - RX-A','CH2 - RX-B','CH3 - TX ref'};
+fig_diag  = figure('Color','k','Name','PHASE 1 - Diagnostic','Position',[40 40 1200 600]);
+
+for ch = 0:NUM_CHANNELS-1
+    ax = subplot(2,3,ch+1);
+    v  = diag_v(:,ch+1)*1e3;
+    pp = pp_all(ch+1)*1e3;
+    if pp > 100
+        set(ax,'Color',[0.03 0.12 0.03]);
+    else
+        set(ax,'Color',[0.10 0.10 0.10]);
+    end
+    plot(t_diag, v, '-', 'Color', cmap(ch+1,:), 'LineWidth', 0.9);
+    hold(ax,'on');
+    yline(0,'--','Color',[0.4 0.4 0.4],'LineWidth',0.5);
+    grid(ax,'on');
+    set(ax,'GridColor',[0.25 0.25 0.25],'XColor',[0.7 0.7 0.7],'YColor',[0.7 0.7 0.7]);
+    xlabel(ax,'ms','FontSize',7,'Color',[0.7 0.7 0.7]);
+    ylabel(ax,'mV','FontSize',7,'Color',[0.7 0.7 0.7]);
+    xlim(ax,[0 max(t_diag(end), 0.001)]);
+    v_clean = v(~isnan(v));
+    mn  = mean(v_clean);
+    pad = max(pp*0.6, 0.1);
+    ylim(ax,[mn-pad*3, mn+pad*3]);
+    if pp > 100
+        title(ax, sprintf('%s  %.1fmV pk-pk  <<<', ch_labels{ch+1}, pp), ...
+              'FontSize',9,'FontWeight','bold','Color',[0.3 1.0 0.3]);
+    else
+        title(ax, sprintf('%s  %.2fmV pk-pk', ch_labels{ch+1}, pp), ...
+              'FontSize',9,'Color',cmap(ch+1,:));
+    end
+end
+
+ax_info = subplot(2,3,6);
+axis off;
+set(ax_info,'Color',[0.08 0.08 0.12]);
+text(ax_info, 0.05, 0.9, ...
+    sprintf(['Phase 2 layout:\n' ...
+             'CH%d RX-A (blue)  - top-left\n' ...
+             'CH%d RX-B (red)   - top-mid\n' ...
+             'CH%d TX  (green)  - top-right\n' ...
+             'FFT all 3 ch      - middle row\n' ...
+             '8-freq bar chart  - bottom row\n\n' ...
+             'Press Enter to start.'], CH_A, CH_B, CH_C), ...
+    'Units','normalized','VerticalAlignment','top', ...
+    'FontName','Courier New','FontSize',10,'Color',[0.85 0.85 0.85]);
+
+sgtitle('CH0-CH3 Diagnostic  |  press Enter to start live plot', ...
+    'FontSize',11,'FontWeight','bold','Color','w');
+drawnow;
+
+input(sprintf('\nPress Enter to start live plot (CH%d / CH%d / CH%d / 8-freq bar)...', ...
+              CH_A, CH_B, CH_C));
+fprintf('\n');
+
+%% =========================================================================
+%% PHASE 2: LIVE TIME DOMAIN + FFT + 8-FREQ BAR
+%% =========================================================================
+fprintf('PHASE 2: Live - Time domain + FFT + 8-frequency bar chart\n');
+fprintf('  Channels      : CH%d (blue)  CH%d (red)  CH%d (green)\n', CH_A, CH_B, CH_C);
+fprintf('  f_DATA        : %d Hz   delta_f : %.3f Hz   Nyquist : %.0f kHz\n', ...
+        f_DATA, delta_f, f_DATA/2/1e3);
+fprintf('  Bar refresh   : every %d bursts\n', BAR_UPDATE_EVERY);
+fprintf('  Close figure to stop.\n\n');
+
+buf_A = zeros(roll_n, 1);
+buf_B = zeros(roll_n, 1);
+buf_C = zeros(roll_n, 1);
+
+COL_A  = [0.25 0.55 1.00];
+COL_B  = [1.00 0.32 0.32];
+COL_C  = [0.25 0.90 0.40];
+COL_BG = [0.06 0.06 0.10];
+COL_GR = [0.18 0.18 0.18];
+COL_TX = [0.75 0.75 0.75];
+
+fig2 = figure('Color',[0.08 0.08 0.10], ...
+    'Name','Live - Time + FFT + 8-Freq Bar  (close to stop)', ...
+    'Position',[40 30 1500 970]);
+
+%% ---- ROW 1: Time domain ------------------------------------------------
+ax_A = subplot(3,3,1);
+h_A  = plot(ax_A, t_axis, buf_A*1e3, '-', 'Color',COL_A, 'LineWidth',0.9);
+hold(ax_A,'on');
+yline(ax_A, 0, '--', 'Color',[0.35 0.35 0.35], 'LineWidth',0.6);
+grid(ax_A,'on');
+set(ax_A,'Color',COL_BG,'GridColor',COL_GR,'XColor',COL_TX,'YColor',COL_TX);
+xlabel(ax_A,'Time (ms)','FontSize',8,'Color',COL_TX);
+ylabel(ax_A,'mV','FontSize',8,'Color',COL_TX);
+title(ax_A, sprintf('CH%d  RX-A', CH_A),'FontSize',10,'FontWeight','bold','Color',COL_A);
+xlim(ax_A,[0 t_axis(end)]);  ylim(ax_A,[-50 50]);
+
+ax_B = subplot(3,3,2);
+h_B  = plot(ax_B, t_axis, buf_B*1e3, '-', 'Color',COL_B, 'LineWidth',0.9);
+hold(ax_B,'on');
+yline(ax_B, 0, '--', 'Color',[0.35 0.35 0.35], 'LineWidth',0.6);
+grid(ax_B,'on');
+set(ax_B,'Color',COL_BG,'GridColor',COL_GR,'XColor',COL_TX,'YColor',COL_TX);
+xlabel(ax_B,'Time (ms)','FontSize',8,'Color',COL_TX);
+ylabel(ax_B,'mV','FontSize',8,'Color',COL_TX);
+title(ax_B, sprintf('CH%d  RX-B', CH_B),'FontSize',10,'FontWeight','bold','Color',COL_B);
+xlim(ax_B,[0 t_axis(end)]);  ylim(ax_B,[-50 50]);
+
+ax_C = subplot(3,3,3);
+h_C  = plot(ax_C, t_axis, buf_C*1e3, '-', 'Color',COL_C, 'LineWidth',0.9);
+hold(ax_C,'on');
+yline(ax_C, 0, '--', 'Color',[0.35 0.35 0.35], 'LineWidth',0.6);
+grid(ax_C,'on');
+set(ax_C,'Color',COL_BG,'GridColor',COL_GR,'XColor',COL_TX,'YColor',COL_TX);
+xlabel(ax_C,'Time (ms)','FontSize',8,'Color',COL_TX);
+ylabel(ax_C,'mV','FontSize',8,'Color',COL_TX);
+title(ax_C, sprintf('CH%d  TX-ref', CH_C),'FontSize',10,'FontWeight','bold','Color',COL_C);
+xlim(ax_C,[0 t_axis(end)]);  ylim(ax_C,[-50 50]);
+
+%% ---- ROW 2: FFT --------------------------------------------------------
+ax_F = subplot(3,3,[4 5 6]);
+
+h_FA = plot(ax_F, f_vec_kHz, zeros(N_fft/2+1,1), '-', 'Color',COL_A, 'LineWidth',0.9);
+hold(ax_F,'on');
+h_FB = plot(ax_F, f_vec_kHz, zeros(N_fft/2+1,1), '-', 'Color',COL_B, 'LineWidth',0.9);
+h_FC = plot(ax_F, f_vec_kHz, zeros(N_fft/2+1,1), '-', 'Color',COL_C, 'LineWidth',0.9);
+
+% Peak markers
+h_pkA = plot(ax_F, 0, 0, 'o', 'MarkerSize',8, ...
+             'MarkerFaceColor','w',   'MarkerEdgeColor',[0.2 0.2 0.2], 'Visible','off');
+h_pkB = plot(ax_F, 0, 0, 'o', 'MarkerSize',8, ...
+             'MarkerFaceColor','y',   'MarkerEdgeColor',[0.2 0.2 0.2], 'Visible','off');
+h_pkC = plot(ax_F, 0, 0, 'o', 'MarkerSize',8, ...
+             'MarkerFaceColor',COL_C, 'MarkerEdgeColor',[0.2 0.2 0.2], 'Visible','off');
+
+% Peak frequency labels
+txt_pkA = text(ax_F, 1, 0.5, '', 'Color','w',   'FontSize',8, 'FontWeight','bold', ...
+               'HorizontalAlignment','center', 'VerticalAlignment','bottom');
+txt_pkB = text(ax_F, 1, 0.5, '', 'Color','y',   'FontSize',8, 'FontWeight','bold', ...
+               'HorizontalAlignment','center', 'VerticalAlignment','bottom');
+txt_pkC = text(ax_F, 1, 0.5, '', 'Color',COL_C, 'FontSize',8, 'FontWeight','bold', ...
+               'HorizontalAlignment','center', 'VerticalAlignment','bottom');
+
+% Vertical lines at each target frequency
+for k = 1:N_TARGET
+    xl            = xline(ax_F, TARGET_FREQS(k)/1e3, '--');
+    xl.Color      = [0.85 0.85 0.20];
+    xl.LineWidth  = 0.8;
+    xl.Label      = TARGET_LABELS{k};
+    xl.FontSize   = 7;
+    xl.FontWeight = 'bold';
+    xl.LabelColor = [0.95 0.95 0.30];
+    xl.LabelVerticalAlignment = 'bottom';
+end
+
+grid(ax_F,'on');
+set(ax_F,'Color',COL_BG,'GridColor',COL_GR,'XColor',COL_TX,'YColor',COL_TX);
+xlabel(ax_F,'Frequency (kHz)','FontSize',9,'Color',COL_TX);
+ylabel(ax_F,'Amplitude (mV)','FontSize',9,'Color',COL_TX);
+xlim(ax_F,[0 f_DATA/2/1e3]);
+ylim(ax_F,[0 1]);
+title(ax_F, sprintf('FFT  -  Hann window  |  delta_f=%.3f Hz  |  N=%d  |  Nyquist=%.0f kHz', ...
+      delta_f, N_fft, f_DATA/2/1e3), 'FontSize',9,'FontWeight','bold','Color',[0.85 0.85 0.85]);
+legend(ax_F, {'RX-A CH1','RX-B CH2','TX-ref CH3'}, ...
+       'TextColor','w','Color',[0.1 0.1 0.15],'EdgeColor',[0.35 0.35 0.35], ...
+       'Location','northeast','FontSize',8);
+
+%% ---- ROW 3: Bar chart --------------------------------------------------
+ax_bar = subplot(3,3,[7 8 9]);
+
+h_bar = bar(ax_bar, 1:N_TARGET, zeros(N_TARGET,3), 'grouped');
+h_bar(1).FaceColor = COL_A;  h_bar(1).FaceAlpha = 0.85;
+h_bar(2).FaceColor = COL_B;  h_bar(2).FaceAlpha = 0.85;
+h_bar(3).FaceColor = COL_C;  h_bar(3).FaceAlpha = 0.85;
+
+% Text labels above each bar
+bar_txt = gobjects(N_TARGET, 3);
+for k = 1:N_TARGET
+    for c = 1:3
+        bar_txt(k,c) = text(ax_bar, k + bar_offsets(c), 0.01, '0.000', ...
+            'HorizontalAlignment','center', 'VerticalAlignment','bottom', ...
+            'FontSize',5.5, 'FontWeight','bold');
+    end
+end
+txt_colors = {COL_A, COL_B, COL_C};
+for c = 1:3
+    for k = 1:N_TARGET
+        set(bar_txt(k,c), 'Color', txt_colors{c});
+    end
+end
+
+set(ax_bar,'Color',COL_BG,'GridColor',COL_GR,'XColor',COL_TX,'YColor',COL_TX);
+set(ax_bar,'XTick',1:N_TARGET,'XTickLabel',TARGET_LABELS,'FontSize',8);
+grid(ax_bar,'on');
+xlabel(ax_bar,'Target Frequency','FontSize',9,'Color',COL_TX);
+ylabel(ax_bar,'Amplitude (mV)','FontSize',9,'Color',COL_TX);
+title(ax_bar, 'Amplitude at 8 Target Frequencies  -  CH1 blue | CH2 red | CH3 green', ...
+      'FontSize',9,'FontWeight','bold','Color',[0.85 0.85 0.85]);
+legend(ax_bar, {'CH1 RX-A','CH2 RX-B','CH3 TX-ref'}, ...
+       'TextColor','w','Color',[0.1 0.1 0.15],'EdgeColor',[0.35 0.35 0.35], ...
+       'Location','northeast','FontSize',8);
+xlim(ax_bar,[0.4, N_TARGET+0.6]);
+ylim(ax_bar,[0 1]);
+
+%% ---- Figure title + HUD ------------------------------------------------
+sgtitle(sprintf('Live  |  f_DATA=%d Hz   Vref=%.3fV   k=%d   bar refresh=1/%d', ...
+    f_DATA, VREF, K_GAIN, BAR_UPDATE_EVERY), ...
+    'FontSize',9,'FontWeight','bold','Color','w');
+
+hud = annotation('textbox', [0.01 0.001 0.98 0.028], ...
+    'String','Waiting for first burst...', ...
+    'EdgeColor',[0.25 0.25 0.30], 'BackgroundColor',[0.07 0.07 0.12], ...
+    'HorizontalAlignment','center', 'VerticalAlignment','middle', ...
+    'FontSize',7.5, 'FontName','Courier New', 'FontWeight','bold', ...
+    'Color',[0.85 0.9 1.0]);
+
+burst_count = 0;
+t_start     = tic;
+amp_tgt     = zeros(N_TARGET, 3);
+bar_top     = 1;   % cached so bar text can use it between bar updates
+win_sum     = sum(hann_win);   % pre-compute once - saves work inside loop
+
+%% ---- MAIN LOOP ----------------------------------------------------------
+while ishandle(fig2)
+
+    raw = safe_read(s, PACKET_SIZE, BURST_PERIOD);
+    if isempty(raw); continue; end
+
+    [volts, ch_id] = decode_packet(raw, ADC_FULL_SCALE, FS_VOLTAGE);
+    if isempty(volts) || any(ch_id > 3)
+        flush(s); pause(BURST_PERIOD); flush(s);
+        continue;
+    end
+
+    v_A = volts(ch_id == uint8(CH_A));
+    v_B = volts(ch_id == uint8(CH_B));
+    v_C = volts(ch_id == uint8(CH_C));
+    if isempty(v_A) || isempty(v_B) || isempty(v_C); continue; end
+
+    burst_count = burst_count + 1;
+
+    %% ---- Roll buffers --------------------------------------------------
+    n_new = min([length(v_A), length(v_B), length(v_C)]);
+    if n_new >= roll_n
+        buf_A = v_A(end-roll_n+1 : end);
+        buf_B = v_B(end-roll_n+1 : end);
+        buf_C = v_C(end-roll_n+1 : end);
+    else
+        buf_A = [buf_A(n_new+1:end); v_A(1:n_new)];
+        buf_B = [buf_B(n_new+1:end); v_B(1:n_new)];
+        buf_C = [buf_C(n_new+1:end); v_C(1:n_new)];
+    end
+
+    %% ---- FAST PATH: Time-domain update (every burst) -------------------
+    set(h_A, 'YData', buf_A*1e3);
+    set(h_B, 'YData', buf_B*1e3);
+    set(h_C, 'YData', buf_C*1e3);
+
+    % Auto-scale y-axis for each channel
+    bufs = {buf_A, buf_B, buf_C};
+    axs  = {ax_A,  ax_B,  ax_C};
+    for idx = 1:3
+        bv     = bufs{idx};
+        mn_v   = mean(bv) * 1e3;
+        half_v = max((max(bv) - min(bv)) * 1e3 * 0.65, 0.5);
+        ylim(axs{idx}, [mn_v - half_v, mn_v + half_v]);
+    end
+
+    %% ---- FAST PATH: FFT (every burst) ----------------------------------
+    sig_A  = (buf_A - mean(buf_A)) .* hann_win;
+    P_A    = abs(fft(sig_A, N_fft));
+    P_A    = P_A(1:N_fft/2+1) / win_sum * 2 * 1e3;
+    P_A(1) = P_A(1) / 2;
+
+    sig_B  = (buf_B - mean(buf_B)) .* hann_win;
+    P_B    = abs(fft(sig_B, N_fft));
+    P_B    = P_B(1:N_fft/2+1) / win_sum * 2 * 1e3;
+    P_B(1) = P_B(1) / 2;
+
+    sig_C  = (buf_C - mean(buf_C)) .* hann_win;
+    P_C    = abs(fft(sig_C, N_fft));
+    P_C    = P_C(1:N_fft/2+1) / win_sum * 2 * 1e3;
+    P_C(1) = P_C(1) / 2;
+
+    set(h_FA, 'YData', P_A);
+    set(h_FB, 'YData', P_B);
+    set(h_FC, 'YData', P_C);
+
+    fft_top = max([max(P_A), max(P_B), max(P_C)]) * 1.35 + 1e-9;
+    ylim(ax_F, [0, fft_top]);
+
+    % Dominant peaks (skip DC bin 1)
+    [pk_A, idx_A] = max(P_A(2:end));  idx_A = idx_A + 1;
+    [pk_B, idx_B] = max(P_B(2:end));  idx_B = idx_B + 1;
+    [pk_C, idx_C] = max(P_C(2:end));  idx_C = idx_C + 1;
+
+    fq_A = f_vec(idx_A);
+    fq_B = f_vec(idx_B);
+    fq_C = f_vec(idx_C);
+
+    set(h_pkA, 'XData', fq_A/1e3, 'YData', pk_A, 'Visible','on');
+    set(h_pkB, 'XData', fq_B/1e3, 'YData', pk_B, 'Visible','on');
+    set(h_pkC, 'XData', fq_C/1e3, 'YData', pk_C, 'Visible','on');
+
+    lbl_off = fft_top * 0.06;
+    set(txt_pkA, 'Position', [fq_A/1e3, pk_A + lbl_off, 0], 'String', freq_label(fq_A));
+    set(txt_pkB, 'Position', [fq_B/1e3, pk_B + lbl_off, 0], 'String', freq_label(fq_B));
+    set(txt_pkC, 'Position', [fq_C/1e3, pk_C + lbl_off, 0], 'String', freq_label(fq_C));
+
+    % Always compute target amplitudes (cheap - just indexing)
+    amp_tgt(:,1) = P_A(target_bins);
+    amp_tgt(:,2) = P_B(target_bins);
+    amp_tgt(:,3) = P_C(target_bins);
+
+    %% ---- SLOW PATH: Bar chart + text labels (throttled) ----------------
+    if mod(burst_count, BAR_UPDATE_EVERY) == 0
+
+        set(h_bar(1), 'YData', amp_tgt(:,1));
+        set(h_bar(2), 'YData', amp_tgt(:,2));
+        set(h_bar(3), 'YData', amp_tgt(:,3));
+
+        bar_top = max(amp_tgt(:)) * 1.40 + 1e-9;
+        ylim(ax_bar, [0, bar_top]);
+
+        for c = 1:3
+            for k = 1:N_TARGET
+                set(bar_txt(k,c), ...
+                    'Position', [k + bar_offsets(c), amp_tgt(k,c) + bar_top*0.02, 0], ...
+                    'String',   sprintf('%.3f', amp_tgt(k,c)));
+            end
+        end
+    end
+
+    %% ---- Console table every 20 bursts ---------------------------------
+    if mod(burst_count, 20) == 1
+        fprintf('\n  Burst #%d  (%.1f burst/s)\n', burst_count, burst_count/toc(t_start));
+        fprintf('  %-8s  %-12s  %-12s  %-12s\n', ...
+                'Freq','CH1-RXA(mV)','CH2-RXB(mV)','CH3-TX(mV)');
+        fprintf('  %s\n', repmat('-',1,52));
+        for k = 1:N_TARGET
+            fprintf('  %-8s  %+11.4f  %+11.4f  %+11.4f\n', ...
+                    TARGET_LABELS{k}, amp_tgt(k,1), amp_tgt(k,2), amp_tgt(k,3));
+        end
+    end
+
+    %% ---- HUD (no loop string concatenation) ----------------------------
+    % Build target string via vectorised sprintf then join - avoids growing
+    % a string inside a for-loop on every burst.
+    tgt_parts = arrayfun(@(k) sprintf('%s:%.3f/%.3f/%.3f ', ...
+        TARGET_LABELS{k}, amp_tgt(k,1), amp_tgt(k,2), amp_tgt(k,3)), ...
+        1:N_TARGET, 'UniformOutput', false);
+    tgt_str = strjoin(tgt_parts, ' ');
+
+    set(hud, 'String', sprintf( ...
+        'Burst #%d | %.1f bst/s | Peak A:%s@%.3fmV  B:%s@%.3fmV  C:%s@%.3fmV || %s', ...
+        burst_count, burst_count/toc(t_start), ...
+        freq_label(fq_A), pk_A, freq_label(fq_B), pk_B, freq_label(fq_C), pk_C, ...
+        tgt_str));
+
+    drawnow limitrate;
+end
+
+try; delete(s); catch; end
+fprintf('\nStopped after %d bursts (%.1f s).\n', burst_count, toc(t_start));
+fprintf('\nFinal target-frequency amplitude table:\n');
+fprintf('  %-8s  %-12s  %-12s  %-12s\n','Freq','CH1-RXA(mV)','CH2-RXB(mV)','CH3-TX(mV)');
+fprintf('  %s\n', repmat('-',1,52));
+for k = 1:N_TARGET
+    fprintf('  %-8s  %+11.4f  %+11.4f  %+11.4f\n', ...
+            TARGET_LABELS{k}, amp_tgt(k,1), amp_tgt(k,2), amp_tgt(k,3));
+end
+fprintf('\nUse CH_RXA=%d, CH_RXB=%d, CH_TX=%d in Calibration Wizard.\n', CH_A, CH_B, CH_C);
+
+%% =========================================================================
+%% LOCAL FUNCTIONS
+%% =========================================================================
+
+function raw = safe_read(s, PACKET_SIZE, BURST_PERIOD)
+    raw = [];
+    t0  = tic;
+    while true
+        try
+            nb = s.NumBytesAvailable;
+        catch
+            return;
+        end
+        if nb >= PACKET_SIZE
+            break;
+        end
+        if toc(t0) > 3.0
+            flush(s); pause(BURST_PERIOD); flush(s);
+            return;
+        end
+        pause(0.002);
+    end
+    if s.NumBytesAvailable > PACKET_SIZE * 2
+        flush(s); pause(BURST_PERIOD); flush(s);
+        return;
+    end
+    try
+        raw = read(s, PACKET_SIZE, "uint8");
+        if mod(length(raw), 4) ~= 0
+            raw = [];
+        end
+    catch
+        raw = [];
+    end
+end
+
+function [volts, ch_id] = decode_packet(raw, ADC_FULL_SCALE, FS_VOLTAGE)
+    words      = typecast(uint8(raw(:)), 'uint32');
+    ch_id      = uint8(bitshift(words, -24));
+    adc_raw    = bitand(words, uint32(0x00FFFFFF));
+    adc_signed = double(adc_raw);
+    mask       = adc_raw >= uint32(0x800000);
+    adc_signed(mask) = adc_signed(mask) - 2^24;
+    volts      = adc_signed / ADC_FULL_SCALE * FS_VOLTAGE;
+end
+
+function lbl = freq_label(f_hz)
+    if f_hz >= 1000
+        lbl = sprintf('%.2fkHz', f_hz/1e3);
+    else
+        lbl = sprintf('%.1fHz', f_hz);
+    end
+end
