@@ -1,0 +1,87 @@
+/**
+ * These arguments were used when this file was generated. They will be automatically applied on subsequent loads
+ * via the GUI or CLI. Run CLI with '--help' for additional information on how to override these arguments.
+ * @cliArgs --device "MSPM0G350X" --part "Default" --package "LQFP-64(PM)" --product "mspm0_sdk@2.10.00.04"
+ * @v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)" --product "mspm0_sdk@2.10.00.04"
+ * @versions {"tool":"1.26.2+4477"}
+ */
+
+/**
+ * Import the modules used in this configuration.
+ */
+const Board         = scripting.addModule("/ti/driverlib/Board");
+const GPIO          = scripting.addModule("/ti/driverlib/GPIO", {}, false);
+const GPIO1         = GPIO.addInstance();
+const GPIO2         = GPIO.addInstance();
+const GPIO3         = GPIO.addInstance();
+const SPI           = scripting.addModule("/ti/driverlib/SPI", {}, false);
+const SPI1          = SPI.addInstance();
+const SYSCTL        = scripting.addModule("/ti/driverlib/SYSCTL");
+const ProjectConfig = scripting.addModule("/ti/project_config/ProjectConfig");
+
+/**
+ * Write custom configuration values to the imported modules.
+ */
+Board.genPeriphPinFile       = true;
+Board.genResourceCSV         = true;
+Board.genResourceCSVAdvanced = "detailed";
+Board.genFileMod.$name       = "ti_driverlib_BoardPins0";
+Board.genFileCSV.$name       = "ti_driverlib_ResourcesCSV0";
+
+GPIO1.$name                               = "gpioLED";
+GPIO1.associatedPins[0].launchPadShortcut = "LED1En";
+GPIO1.associatedPins[0].$name             = "LED1";
+GPIO1.associatedPins[0].initialValue      = "SET";
+GPIO1.associatedPins[0].pin.$assign       = "PA0";
+
+GPIO2.port                           = "PORTB";
+GPIO2.$name                          = "gpioCLR";
+GPIO2.associatedPins[0].$name        = "clrPIN";
+GPIO2.associatedPins[0].initialValue = "SET";
+GPIO2.associatedPins[0].assignedPin  = "7";
+GPIO2.associatedPins[0].pin.$assign  = "PB7";
+
+GPIO3.$name                          = "gpioLED2";
+GPIO3.associatedPins[0].$name        = "LED2";
+GPIO3.associatedPins[0].initialValue = "SET";
+GPIO3.associatedPins[0].pin.$assign  = "PA27";
+
+SPI1.$name                              = "mySPI";
+SPI1.phase                              = "1";
+SPI1.targetBitRate                      = 16000000;
+SPI1.peripheral.$assign                 = "SPI1";
+SPI1.peripheral.sclkPin.$assign         = "PB9";
+SPI1.peripheral.mosiPin.$assign         = "PB8";
+SPI1.peripheral.cs0Pin.$assign          = "PB6";
+SPI1.sclkPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric0";
+SPI1.sclkPinConfig.direction            = scripting.forceWrite("OUTPUT");
+SPI1.sclkPinConfig.onlyInternalResistor = scripting.forceWrite(false);
+SPI1.sclkPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
+SPI1.mosiPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric1";
+SPI1.mosiPinConfig.direction            = scripting.forceWrite("OUTPUT");
+SPI1.mosiPinConfig.hideOutputInversion  = scripting.forceWrite(false);
+SPI1.mosiPinConfig.onlyInternalResistor = scripting.forceWrite(false);
+SPI1.mosiPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
+SPI1.misoPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric2";
+SPI1.misoPinConfig.onlyInternalResistor = scripting.forceWrite(false);
+SPI1.misoPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
+SPI1.cs0PinConfig.$name                 = "ti_driverlib_gpio_GPIOPinGeneric3";
+SPI1.cs0PinConfig.direction             = scripting.forceWrite("OUTPUT");
+SPI1.cs0PinConfig.hideOutputInversion   = scripting.forceWrite(false);
+SPI1.cs0PinConfig.onlyInternalResistor  = scripting.forceWrite(false);
+SPI1.cs0PinConfig.passedPeripheralType  = scripting.forceWrite("Digital");
+
+
+ProjectConfig.genLibDrivers = true;
+ProjectConfig.genLibGC      = true;
+
+/**
+ * Pinmux solution for unlocked pins/peripherals. This ensures that minor changes to the automatic solver in a future
+ * version of the tool will not impact the pinmux you originally saw.  These lines can be completely deleted in order to
+ * re-solve from scratch.
+ */
+Board.peripheral.$suggestSolution          = "DEBUGSS";
+Board.peripheral.swclkPin.$suggestSolution = "PA20";
+Board.peripheral.swdioPin.$suggestSolution = "PA19";
+SPI1.peripheral.misoPin.$suggestSolution   = "PA16";
+SYSCTL.peripheral.$suggestSolution         = "SYSCTL";

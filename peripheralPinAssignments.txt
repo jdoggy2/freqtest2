@@ -1,0 +1,16 @@
+
+- GPIOA:
+	+ Open-Drain Output: PA0
+	+ Standard Output: PA27
+- GPIOB:
+	+ Standard Output: PB7
+- SYSCTL
+- SPI1:
+	+ SPI SCLK (Clock): PB9
+	+ SPI PICO (Peripheral In, Controller Out): PB8
+	+ SPI POCI (Peripheral Out, Controller In): PA16
+	+ SPI CS0 (Chip Select 0): PB6
+- EVENT
+- BOARD:
+	+ Debug Clock: PA20
+	+ Debug Data In Out: PA19
