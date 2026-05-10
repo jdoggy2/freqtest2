@@ -1,5 +1,9 @@
 # freqtest2
-Texas Instruments - sine wave generator
+
+## sine wave generator
+
+microcontroller : MSPM0G3507 LP
+DAC : DAC80508MC
 
 included files:
 
