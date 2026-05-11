@@ -1,9 +1,9 @@
 # freqtest2
 
-## sine wave generator
+### sine wave generator
 
-microcontroller : MSPM0G3507 LP
-DAC : DAC80508MC
+## microcontroller : MSPM0G3507 LP
+## DAC : DAC80508MC
 
 included files:
 
